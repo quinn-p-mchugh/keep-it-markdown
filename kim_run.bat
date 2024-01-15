@@ -1,1 +1,1 @@
-python kim.py -b --all -o
+python kim.py -b --all -o -m
