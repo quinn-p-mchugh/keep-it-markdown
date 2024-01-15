@@ -3,15 +3,16 @@ import gkeepapi
 import keyring
 import getpass
 import requests
-import imghdr
 import shutil
 import re
 import configparser
 import click
+import datetime
 from os.path import join
 from pathlib import Path
 from dataclasses import dataclass
 from xmlrpc.client import boolean
+from PIL import Image
 
 
 KEEP_KEYRING_ID = 'google-keep-token'
@@ -22,7 +23,8 @@ USERID_EMPTY = 'add your google account name here'
 OUTPUTPATH = 'mdfiles'
 MEDIADEFAULTPATH = "media"
 INPUTDEFAULTPATH = "import/markdown_files"
-DEFAULTLABELS = "my_label"
+DEFAULT_LABELS = "my_label"
+DEFAULT_SEPARATOR = "/"
 MAX_FILENAME_LENGTH = 99
 MISSING = 'null value'
 
@@ -53,7 +55,8 @@ default_settings = {
     'output_path': OUTPUTPATH,
     'media_path': MEDIADEFAULTPATH,
     'input_path': INPUTDEFAULTPATH,
-    'input_labels': DEFAULTLABELS
+    'input_labels': DEFAULT_LABELS,
+    'folder_separator': DEFAULT_SEPARATOR
 }
 
 
@@ -67,6 +70,8 @@ class Options:
     skip_existing: boolean 
     text_for_title: boolean
     logseq_style: boolean
+    joplin_frontmatter: boolean
+    move_to_archive: boolean
     import_files: boolean
 
 @dataclass
@@ -81,6 +86,7 @@ class Note:
     blobs: list
     blob_names: list
     media: list
+    header: str
 
 
 
@@ -93,18 +99,15 @@ class ConfigurationException(Exception):
         return self.msg
 
 
-# This is a static class instance - not really necessary but saves a tiny bit of memory 
+# This is a singleton class instance - not really necessary but saves a tiny bit of memory 
 # Very useful for single connections and loading config files once
 class Config:
-
     _config = configparser.ConfigParser()
     _configdict = {}
 
     def __new__(cls):
         if not hasattr(cls, 'instance'):
             cls.instance = super(Config, cls).__new__(cls)
-            #cls.instance._config = configparser.ConfigParser()
-            #cls.instance._configdict = {}
             cls.instance.__read()
             cls.instance.__load()
         return cls.instance
@@ -142,8 +145,6 @@ class Config:
 
 #All conversions to markdown are static methods 
 class Markdown:
-    #Note that the use of temporary %%% is because notes 
-    #   can have the same URL repeated and replace would fail
     @staticmethod
     def convert_urls(text):
         # pylint: disable=anomalous-backslash-in-string
@@ -152,7 +153,8 @@ class Markdown:
                 "|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+",
             text
         )
-
+        #Note that the use of temporary %%% is because notes 
+        #   can have the same URL repeated and replace would fail
         for url in urls:
             text = text.replace(url, 
                 "[" + url[:1] + "%%%" + url[2:] + 
@@ -181,12 +183,12 @@ class Markdown:
         return(text.replace(u"\u2610", '- [ ]').replace(u"\u2611", ' - [x]'))
 
     @staticmethod
-    def format_path(path, name, media):
+    def format_path(path, name, media, replacement):
         if media:
             header = "!["
         else:
             header = "["
-        path = path.replace(" ", "%20")
+        path = path.replace(" ", replacement)
         if name:
             return (header + name + "](" + path + ")")
         else:
@@ -247,10 +249,7 @@ class KeepService:
     def set_user(self, userid):
         self._userid = userid
 
-
     def login(self, pw, keyring_reset):
-
-        #self._userid = userid
         try:
             self._keepapi.login(self._userid, pw)
         except:
@@ -260,7 +259,6 @@ class KeepService:
             if keyring_reset == False:
                 self._securestorage.set_keyring(self._keep_token)
             return self._keep_token
-
 
     def resume(self):
         self._keepapi.resume(self._userid, self._keep_token)
@@ -279,7 +277,13 @@ class KeepService:
     def createnote(self, title, notetext):
         self._note = self._keepapi.createNote(title, notetext)
         return(None)
-
+    
+    def appendnotes(self, kquery, append_text):
+        gnotes = self.findnotes(kquery, False, False)
+        for gnote in gnotes:
+            gnote.text += "\n\n" + append_text
+        self.keep_sync()
+        return(None)
 
     def setnotelabel(self, label):
         try:
@@ -288,7 +292,6 @@ class KeepService:
         except Exception as e:
             print('Label doesn\'t exist! - label: ' +  label + "  Use pre-defined labels when importing")
             raise
-
 
     def getmedia(self, blob):
         try:
@@ -330,7 +333,6 @@ class NameService:
 
 
 class FileService:
-
     def media_path (self):
         outpath = Config().get("output_path").rstrip("/")
         mediapath = outpath + "/" + Config().get("media_path").rstrip("/") + "/"
@@ -344,11 +346,9 @@ class FileService:
         inpath = Config().get("input_path").rstrip("/") + "/"
         return(inpath)
 
-  
     def create_path(self, path):
         if not os.path.exists(path):
             os.mkdir(path)
-
 
     def write_file(self, file_name, data):
         try:
@@ -357,7 +357,6 @@ class FileService:
             f.close
         except Exception as e:
             raise Exception("Error in write_file: " + " -- " + TECH_ERR + repr(e))
-
 
     def download_file(self, file_url, file_name, file_path):
         try:
@@ -378,23 +377,30 @@ class FileService:
             raise
 
     def set_file_extensions(self, data_file, file_name, file_path):
-
         dest_path = file_path + file_name
 
-        if imghdr.what(data_file) == 'png':
+        try:
+            image = Image.open(data_file)
+            what = image.format.lower()
+            image.close()
+        except:
+            what = ".m4a"
+
+
+        if what == 'png':
             media_name = file_name + ".png"
             blob_final_path = dest_path + ".png"
-        elif imghdr.what(data_file) == 'jpeg':
+        elif what == 'jpeg':
             media_name = file_name + ".jpg"
             blob_final_path = dest_path + ".jpg"
-        elif imghdr.what(data_file) == 'gif':
+        elif what == 'gif':
             media_name = file_name + ".gif"
             blob_final_path = dest_path + ".gif"
-        elif imghdr.what(data_file) == 'webp':
+        elif what == 'webp':
             media_name = file_name + ".webp"
             blob_final_path = dest_path + ".webp"
         else:
-            extension = ".aac"
+            extension = ".m4a"
             media_name = file_name + extension
             blob_final_path = dest_path + extension
 
@@ -408,9 +414,7 @@ class FileService:
 
 
 def save_md_file(note, note_tags, note_date, overwrite, skip_existing):
-
     try:
-
         fs = FileService()
 
         md_text = Markdown().format_check_boxes(note.text)
@@ -418,7 +422,7 @@ def save_md_file(note, note_tags, note_date, overwrite, skip_existing):
 
         for media in note.media:
             md_text = Markdown().format_path(Config().get("media_path") + 
-                "/" + media, "", True) + "\n" + md_text
+                "/" + media, "", True, "_") + "\n" + md_text
  
 
         md_file = Path(fs.outpath(), note.title + ".md")
@@ -435,13 +439,20 @@ def save_md_file(note, note_tags, note_date, overwrite, skip_existing):
         print(note_tags)
         print(note_date + "\r\n")
 
+        if not (note.timestamps):
+            timestamps = ""
+        else:
+            timestamps = ("Created: " + note.timestamps["created"]
+                        [ : note.timestamps["created"].rfind('.') ] + "   ---   " + 
+                        "Updated: " + note.timestamps["updated"]
+                        [ : note.timestamps["updated"].rfind('.') ] + "\n\n")
 
         markdown_data = (
+            note.header + 
             Markdown().convert_urls(md_text) + "\n" + 
             "\n" + note_tags + "\n\n" + 
-            "Created: " + note.timestamps["created"][ : note.timestamps["created"].rfind('.') ] + "   ---   "
-            "Updated: " + note.timestamps["updated"][ : note.timestamps["updated"].rfind('.') ] + "\n\n" + 
-            Markdown().format_path(KEEP_NOTE_URL + str(note.id), "", False) + "\n\n")
+            timestamps + 
+            Markdown().format_path(KEEP_NOTE_URL + str(note.id), "", False, "%20") + "\n\n")
 
         fs.write_file(md_file, markdown_data)
         return (1)
@@ -449,15 +460,20 @@ def save_md_file(note, note_tags, note_date, overwrite, skip_existing):
         raise Exception("Problem with markdown file creation: " + str(md_file) + " -- " + TECH_ERR + repr(e))
 
 
-def keep_import_notes(keep):
 
+def keep_import_notes(keep):
     try:
         dir_path = FileService().inpath()
         in_labels = Config().get("input_labels").split(",")
         for file in os.listdir(dir_path):
             if os.path.isfile(dir_path + file) and file.endswith('.md'):
-                with open(dir_path + file, 'r') as md_file:
+                with open(dir_path + file, 'r', encoding="utf8") as md_file:
+                    mod_time = datetime.datetime.fromtimestamp(
+                        os.path.getmtime(dir_path + file)).strftime('%Y-%m-%d %H:%M:%S')
+                    crt_time = datetime.datetime.fromtimestamp(
+                        os.path.getctime(dir_path + file)).strftime('%Y-%m-%d %H:%M:%S')
                     data=md_file.read()
+                    data += "\n\nCreated: " + crt_time + "   -   Updated: " + mod_time
                     print('Importing note:', file.replace('.md', '') + " from " + file)
                     keep.createnote(file.replace('.md', ''), data)
                     for in_label in in_labels:
@@ -469,10 +485,9 @@ def keep_import_notes(keep):
 
 
 def keep_get_blobs(keep, note):
-
     fs = FileService()
     for idx, blob in enumerate(note.blobs):
-        note.blob_names[idx] = note.title + str(idx)
+        note.blob_names[idx] = note.title.replace(" ", "_") + str(idx)
         if blob != None:
             url = keep.getmedia(blob)
             blob_file = None
@@ -487,8 +502,6 @@ def keep_get_blobs(keep, note):
 
 
 def keep_query_convert(keep, keepquery, opts):
-
-
     try:
         count = 0
         ccnt = 0
@@ -511,14 +524,18 @@ def keep_query_convert(keep, keepquery, opts):
                     gnote.text, 
                     gnote.archived,
                     gnote.trashed,
-                   {"created": str(gnote.timestamps.created), 
+                    {"created": str(gnote.timestamps.created), 
                         "updated": str(gnote.timestamps.updated)},
                     [str(label) for label in gnote.labels.all()],
                     [blob for blob in gnote.blobs],
                     ['' for blob in gnote.blobs], 
-                    []
+                    [],
+                    ""
                    )
             )
+            if opts.move_to_archive:
+                gnote.archived = True
+
  
         for note in notes:
 
@@ -526,12 +543,14 @@ def keep_query_convert(keep, keepquery, opts):
 
             if note.title == '':
                 if opts.text_for_title:
-                    note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', '', note.text[0:50])  #.replace(' ',''))
+                    if note.text == '':
+                        note.title = note_date
+                    else:
+                        note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', '', note.text[0:50])  #.replace(' ',''))
                 else:
                     note.title = note_date
 
-            note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', ' ', note.title[0:99])  #re.sub('[^A-z0-9-]', ' ', gnote.title)[0:99]
-            #note_text = gnote.text #gnote.text.replace('”','"').replace('“','"').replace("‘","'").replace("’","'").replace('•', "-").replace(u"\u2610", '[ ]').replace(u"\u2611", '[x]').replace(u'\xa0', u' ').replace(u'\u2013', '--').replace(u'\u2014', '--').replace(u'\u2026', '...').replace(u'\u00b1', '+/-')
+            note.title = re.sub('[' + re.escape(''.join(ILLEGAL_FILE_CHARS)) + ']', ' ', note.title[0:99]) 
 
             labels = note.labels
             note_labels = ""
@@ -541,23 +560,47 @@ def keep_query_convert(keep, keepquery, opts):
             else:
                 for label in labels:
                     note_labels = note_labels + " #" + str(label).replace(' ', '-').replace('&', 'and')
-                note_labels = re.sub('[' + re.escape(''.join(ILLEGAL_TAG_CHARS)) + ']', '-', note_labels)  #re.sub('[^A-z0-9-_# ]', '-', note_labels)
+                note_labels = re.sub('[' + re.escape(''.join(ILLEGAL_TAG_CHARS)) + 
+                                     ']', '-', note_labels)  
 
- 
             if opts.logseq_style:
-                #Logseq test
-                note.text = "- " + note.text.replace("\n\n", "\n- ")
+                c = note.text[:1]
+                if c == u"\u2610" or c == u"\u2611":
+                    note.text.replace("\n\n", "\n- ")
+                else:
+                    note.text = "- " + note.text.replace("\n\n", "\n- ")
+
+            if opts.joplin_frontmatter:
+                joplin_labels = ""
+                for label in note_labels.replace("#", "").split():
+                    joplin_labels += "  - " + label + "\n"
+                note.header = ("---\ntitle: " + note.title + 
+                            "\nupdated: " + note.timestamps["updated"] + 
+                            "Z\ncreated: " + note.timestamps["created"] + 
+                            "Z\ntags:\n" + joplin_labels + 
+                            "---\n\n")
+                note_labels = ""
+                note.timestamps = {}
+
 
             if opts.archive_only:
                 if note.archived and note.trashed == False:
                     keep_get_blobs(keep, note)
-                    ccnt = save_md_file(note, note_labels, note_date, opts.overwrite, opts.skip_existing)
+                    ccnt = save_md_file(note, 
+                                        note_labels, 
+                                        note_date, 
+                                        opts.overwrite, 
+                                        opts.skip_existing)
                 else:
                     ccnt = 0
             else:
                 if note.archived == False and note.trashed == False:
                     keep_get_blobs(keep, note)
-                    ccnt = save_md_file(note, note_labels, note_date, opts.overwrite, opts.skip_existing)
+                    ccnt = save_md_file(note, 
+                                        note_labels, 
+                                        note_date, 
+                                        opts.overwrite, 
+                                        opts.skip_existing)
                 else:
                     ccnt = 0
 
@@ -565,6 +608,9 @@ def keep_query_convert(keep, keepquery, opts):
 
         if opts.overwrite or opts.skip_existing:
             NameService().clear_name_list()
+
+        if opts.move_to_archive:
+            keep.keep_sync()
 
         return (count)
     except:
@@ -577,7 +623,6 @@ def keep_query_convert(keep, keepquery, opts):
 
 
 def ui_login(keyring_reset, master_token):
-
     try:
         userid = Config().get("google_userid").strip().lower()
 
@@ -616,7 +661,6 @@ def ui_login(keyring_reset, master_token):
 
 
 def ui_query(keep, search_term, opts):
-
     try:
         if search_term != None:
             count = keep_query_convert(keep, search_term, opts)
@@ -642,7 +686,6 @@ def ui_query(keep, search_term, opts):
 
 def ui_welcome_config():
     try:
-
         mp = Config().get("media_path")
 
         if ((":" in mp) or (mp[0] == '/')):
@@ -669,18 +712,20 @@ def ui_welcome_config():
 @click.option('-s', is_flag=True, help="Skip over any existing notes with the same title")
 @click.option('-c', is_flag=True, help="Use starting content within note body instead of create date for md filename")
 @click.option('-l', is_flag=True, help="Prepend paragraphs with Logseq style bullets")
+@click.option('-j', is_flag=True, help="Prepend notes with Joplin front matter tags and dates")
+@click.option('-m', is_flag=True, help="Move any exported Keep notes to Archive")
 @click.option('-i', is_flag=True, help="Import notes from markdown files EXPERIMENTAL!!")
 @click.option('-b', '--search-term', help="Run in batch mode with a specific Keep search term")
 @click.option('-t', '--master-token', help="Log in using master keep token")
-def main(r, o, a, p, s, c, l, i, search_term, master_token):
+def main(r, o, a, p, s, c, l, j, m, i, search_term, master_token):
 
     try:
 
-        opts = Options(o, a, p, s, c, l, i)
-
+        #m = True
+        opts = Options(o, a, p, s, c, l, j, m, i)
         click.echo("\r\nWelcome to Keep it Markdown or KIM!\r\n")
 
-        if i and (r or o or a or s or p or c):
+        if i and (r or o or a or s or p or c or m):
             print ("Importing markdown notes with export options is not compatible -- please use -i only to import")
             exit()
 
@@ -692,7 +737,7 @@ def main(r, o, a, p, s, c, l, i, search_term, master_token):
 
         keep = ui_login(r, master_token)
 
-        #i = True
+
         if i:
             keep_import_notes(keep)
         else:
@@ -704,7 +749,7 @@ def main(r, o, a, p, s, c, l, i, search_term, master_token):
     #    raise Exception("Problem with markdown file creation: " + repr(e))
 
 
-#Version 0.5.0
+#Version 0.5.4
 
 if __name__ == '__main__':
 
